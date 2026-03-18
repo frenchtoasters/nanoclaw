@@ -15,22 +15,12 @@
 
 ---
 
-<h2 align="center">🐳 Now Runs in Docker Sandboxes</h2>
-<p align="center">Every agent gets its own isolated container inside a micro VM.<br>Hypervisor-level isolation. Millisecond startup. No complex setup.</p>
+<h2 align="center">☸️ Kubernetes-Native Fork</h2>
+<p align="center">Agents run as K8s Jobs with PostgreSQL storage and PG LISTEN/NOTIFY IPC.<br>No Docker daemon required. Scales with your cluster.</p>
 
-**macOS (Apple Silicon)**
-```bash
-curl -fsSL https://nanoclaw.dev/install-docker-sandboxes.sh | bash
-```
+> This is the **Kubernetes fork** of NanoClaw. For the original local Docker version, see [upstream](https://github.com/qwibitai/nanoclaw).
 
-**Windows (WSL)**
-```bash
-curl -fsSL https://nanoclaw.dev/install-docker-sandboxes-windows.sh | bash
-```
-
-> Currently supported on macOS (Apple Silicon) and Windows (x86). Linux support coming soon.
-
-<p align="center"><a href="https://nanoclaw.dev/blog/nanoclaw-docker-sandboxes">Read the announcement →</a>&nbsp; · &nbsp;<a href="docs/docker-sandboxes.md">Manual setup guide →</a></p>
+<p align="center"><a href="docs/kubernetes.md">Kubernetes deployment guide →</a></p>
 
 ---
 
@@ -73,6 +63,7 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 **Customization = code changes.** No configuration sprawl. Want different behavior? Modify the code. The codebase is small enough that it's safe to make changes.
 
 **AI-native.**
+
 - No installation wizard; Claude Code guides setup.
 - No monitoring dashboard; ask Claude what's happening.
 - No debugging tools; describe the problem and Claude fixes it.
@@ -88,7 +79,7 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 - **Main channel** - Your private channel (self-chat) for admin control; every group is completely isolated
 - **Scheduled tasks** - Recurring jobs that run Claude and can message you back
 - **Web access** - Search and fetch content from the Web
-- **Container isolation** - Agents are sandboxed in [Docker Sandboxes](https://nanoclaw.dev/blog/nanoclaw-docker-sandboxes) (micro VM isolation), Apple Container (macOS), or Docker (macOS/Linux)
+- **Container isolation** - Agents are sandboxed as Kubernetes Jobs with PVC-based filesystem isolation and resource limits
 - **Agent Swarms** - Spin up teams of specialized agents that collaborate on complex tasks
 - **Optional integrations** - Add Gmail (`/add-gmail`) and more via skills
 
@@ -103,6 +94,7 @@ Talk to your assistant with the trigger word (default: `@Andy`):
 ```
 
 From the main channel (your self-chat), you can manage groups and tasks:
+
 ```
 @Andy list all scheduled tasks across groups
 @Andy pause the Monday briefing task
@@ -135,52 +127,58 @@ Users then run `/add-telegram` on their fork and get clean code that does exactl
 Skills we'd like to see:
 
 **Communication Channels**
+
 - `/add-signal` - Add Signal as a channel
 
 **Session Management**
+
 - `/clear` - Add a `/clear` command that compacts the conversation (summarizes context while preserving critical information in the same session). Requires figuring out how to trigger compaction programmatically via the Claude Agent SDK.
 
 ## Requirements
 
-- macOS or Linux
+- Kubernetes cluster (1.25+) — EKS, GKE, AKS, minikube, or kind
 - Node.js 20+
 - [Claude Code](https://claude.ai/download)
-- [Apple Container](https://github.com/apple/container) (macOS) or [Docker](https://docker.com/products/docker-desktop) (macOS/Linux)
+- RWX-capable StorageClass (EFS, Filestore, NFS, or hostPath for dev)
+- Container registry accessible from the cluster
 
 ## Architecture
 
 ```
-Channels --> SQLite --> Polling loop --> Container (Claude Agent SDK) --> Response
+Channels --> PostgreSQL --> Polling loop --> K8s Job (Claude Agent SDK) --> Response (PG LISTEN/NOTIFY)
 ```
 
-Single Node.js process. Channels are added via skills and self-register at startup — the orchestrator connects whichever ones have credentials present. Agents execute in isolated Linux containers with filesystem isolation. Only mounted directories are accessible. Per-group message queue with concurrency control. IPC via filesystem.
+Single Node.js orchestrator pod. Channels are added via skills and self-register at startup — the orchestrator connects whichever ones have credentials present. Agents execute as Kubernetes Jobs with PVC-based filesystem isolation. Per-group message queue with global concurrency control. IPC via PostgreSQL LISTEN/NOTIFY.
 
-For the full architecture details, see [docs/SPEC.md](docs/SPEC.md).
+For the full architecture and deployment details, see [docs/kubernetes.md](docs/kubernetes.md) and [docs/SPEC.md](docs/SPEC.md).
 
 Key files:
+
 - `src/index.ts` - Orchestrator: state, message loop, agent invocation
 - `src/channels/registry.ts` - Channel registry (self-registration at startup)
-- `src/ipc.ts` - IPC watcher and task processing
+- `src/ipc.ts` - IPC via PostgreSQL LISTEN/NOTIFY
 - `src/router.ts` - Message formatting and outbound routing
 - `src/group-queue.ts` - Per-group queue with global concurrency limit
-- `src/container-runner.ts` - Spawns streaming agent containers
-- `src/task-scheduler.ts` - Runs scheduled tasks
-- `src/db.ts` - SQLite operations (messages, groups, sessions, state)
+- `src/container-runner.ts` - Creates K8s Jobs for agent execution
+- `src/container-runtime.ts` - K8s client initialization and Job lifecycle
+- `src/task-scheduler.ts` - Runs scheduled tasks as K8s Jobs
+- `src/db.ts` - PostgreSQL operations (messages, groups, sessions, state)
 - `groups/*/CLAUDE.md` - Per-group memory
+- `k8s/` - Kubernetes deployment manifests (Kustomize)
 
 ## FAQ
 
-**Why Docker?**
+**Why Kubernetes?**
 
-Docker provides cross-platform support (macOS, Linux and even Windows via WSL2) and a mature ecosystem. On macOS, you can optionally switch to Apple Container via `/convert-to-apple-container` for a lighter-weight native runtime.
+This fork replaces the local Docker runtime with Kubernetes-native execution. Agents run as K8s Jobs, state lives in PostgreSQL, and IPC uses PG LISTEN/NOTIFY. This enables deployment to managed clusters (EKS, GKE, AKS) with proper resource limits, RBAC, and cloud identity integration.
 
-**Can I run this on Linux?**
+**Can I run this locally?**
 
-Yes. Docker is the default runtime and works on both macOS and Linux. Just run `/setup`.
+Yes. Use minikube or kind for local development. See [docs/kubernetes.md](docs/kubernetes.md) for setup instructions.
 
 **Is this secure?**
 
-Agents run in containers, not behind application-level permission checks. They can only access explicitly mounted directories. You should still review what you're running, but the codebase is small enough that you actually can. See [docs/SECURITY.md](docs/SECURITY.md) for the full security model.
+Agents run as Kubernetes Jobs with PVC-based filesystem isolation. They can only access explicitly mounted volumes. You should still review what you're running, but the codebase is small enough that you actually can. See [docs/SECURITY.md](docs/SECURITY.md) for the full security model.
 
 **Why no configuration files?**
 
@@ -196,6 +194,7 @@ ANTHROPIC_AUTH_TOKEN=your-token-here
 ```
 
 This allows you to use:
+
 - Local models via [Ollama](https://ollama.ai) with an API proxy
 - Open-source models hosted on [Together AI](https://together.ai), [Fireworks](https://fireworks.ai), etc.
 - Custom model deployments with Anthropic-compatible APIs
