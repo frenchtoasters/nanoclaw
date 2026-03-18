@@ -1,0 +1,98 @@
+---
+# PostgreSQL StatefulSet for NanoClaw
+# Uses a single replica with a persistent volume for data.
+# For production, consider using a managed database (RDS, Cloud SQL, etc.)
+# and removing this manifest entirely.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: nanoclaw
+  labels:
+    app: nanoclaw
+    component: postgres
+spec:
+  ports:
+    - port: 5432
+      targetPort: 5432
+  clusterIP: None
+  selector:
+    app: nanoclaw
+    component: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: nanoclaw
+  labels:
+    app: nanoclaw
+    component: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nanoclaw
+      component: postgres
+  template:
+    metadata:
+      labels:
+        app: nanoclaw
+        component: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: nanoclaw
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: nanoclaw-db
+                  key: POSTGRES_USER
+                  optional: true
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nanoclaw-db
+                  key: POSTGRES_PASSWORD
+                  optional: true
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: '1'
+              memory: 1Gi
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - postgres
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - postgres
+            initialDelaySeconds: 5
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi

@@ -1,0 +1,90 @@
+---
+# NanoClaw Orchestrator Deployment
+# Runs the main NanoClaw process that listens for channel messages,
+# creates K8s Jobs for agent execution, and manages IPC via Postgres.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nanoclaw-orchestrator
+  namespace: nanoclaw
+  labels:
+    app: nanoclaw
+    component: orchestrator
+spec:
+  replicas: 1 # Single replica — no leader election implemented
+  selector:
+    matchLabels:
+      app: nanoclaw
+      component: orchestrator
+  template:
+    metadata:
+      labels:
+        app: nanoclaw
+        component: orchestrator
+    spec:
+      serviceAccountName: nanoclaw-orchestrator
+      containers:
+        - name: orchestrator
+          image: nanoclaw-orchestrator:latest # Replace with your registry image
+          command: ['node', 'dist/index.js']
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nanoclaw-db
+                  key: DATABASE_URL
+            - name: AGENT_IMAGE
+              value: nanoclaw-agent:latest # Replace with your registry image
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ANTHROPIC_BASE_URL
+              value: '' # Set if using a proxy or non-default endpoint
+            - name: ASSISTANT_NAME
+              value: Andy
+            - name: MAX_CONCURRENT_CONTAINERS
+              value: '5'
+            - name: JOB_TTL_SECONDS
+              value: '600'
+            - name: JOB_ACTIVE_DEADLINE
+              value: '1800'
+            - name: JOB_CPU_REQUEST
+              value: 250m
+            - name: JOB_CPU_LIMIT
+              value: '1'
+            - name: JOB_MEMORY_REQUEST
+              value: 256Mi
+            - name: JOB_MEMORY_LIMIT
+              value: 1Gi
+            - name: TZ
+              value: UTC
+          volumeMounts:
+            - name: groups
+              mountPath: /app/groups
+            - name: store
+              mountPath: /app/store
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: '1'
+              memory: 512Mi
+          livenessProbe:
+            exec:
+              command: ['node', '-e', 'process.exit(0)']
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            exec:
+              command: ['node', '-e', 'process.exit(0)']
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: groups
+          persistentVolumeClaim:
+            claimName: groups-pvc
+        - name: store
+          persistentVolumeClaim:
+            claimName: store-pvc

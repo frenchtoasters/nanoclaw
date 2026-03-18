@@ -1,0 +1,54 @@
+---
+# Workspace PVCs for NanoClaw
+# These provide persistent storage for group data, global shared data, and config.
+# Adjust storageClassName for your cluster (e.g., efs-sc for AWS, standard-rwx for GCP).
+
+# Global shared storage — mounted read-only by non-main groups
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: global-pvc
+  namespace: nanoclaw
+  labels:
+    app: nanoclaw
+    component: storage
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+  # storageClassName: standard-rwx  # Uncomment and set for your cluster
+---
+# Groups config storage — holds CLAUDE.md and group definitions
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: groups-pvc
+  namespace: nanoclaw
+  labels:
+    app: nanoclaw
+    component: storage
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName: standard-rwx  # Uncomment and set for your cluster
+---
+# Store directory — holds channel auth data and local state
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: store-pvc
+  namespace: nanoclaw
+  labels:
+    app: nanoclaw
+    component: storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

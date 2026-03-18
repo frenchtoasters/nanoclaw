@@ -1,0 +1,70 @@
+---
+# RBAC for NanoClaw Orchestrator
+# The orchestrator needs permissions to create/manage Jobs, ConfigMaps,
+# Secrets, and Pods within its namespace.
+
+# ServiceAccount for the orchestrator
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nanoclaw-orchestrator
+  namespace: nanoclaw
+  labels:
+    app: nanoclaw
+    component: orchestrator
+---
+# Role with minimum permissions for orchestrator operation
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nanoclaw-orchestrator
+  namespace: nanoclaw
+  labels:
+    app: nanoclaw
+    component: orchestrator
+rules:
+  # Job management — create agent Jobs, watch status, clean up
+  - apiGroups: ['batch']
+    resources: ['jobs']
+    verbs: ['create', 'get', 'list', 'watch', 'delete', 'deletecollection']
+  # CronJob management — for scheduled tasks
+  - apiGroups: ['batch']
+    resources: ['cronjobs']
+    verbs: ['create', 'get', 'list', 'watch', 'update', 'delete']
+  # Pod access — read logs from agent Job pods
+  - apiGroups: ['']
+    resources: ['pods']
+    verbs: ['get', 'list', 'watch']
+  - apiGroups: ['']
+    resources: ['pods/log']
+    verbs: ['get']
+  # ConfigMap management — CLAUDE.md configs mounted into Jobs
+  - apiGroups: ['']
+    resources: ['configmaps']
+    verbs: ['create', 'get', 'update', 'patch', 'delete']
+  # Secret read — verify secrets exist (not create — that's manual via skill)
+  - apiGroups: ['']
+    resources: ['secrets']
+    verbs: ['get', 'list']
+  # PVC management — for custom volume skill
+  - apiGroups: ['']
+    resources: ['persistentvolumeclaims']
+    verbs: ['create', 'get', 'list', 'watch', 'delete']
+---
+# Bind the role to the service account
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nanoclaw-orchestrator
+  namespace: nanoclaw
+  labels:
+    app: nanoclaw
+    component: orchestrator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: nanoclaw-orchestrator
+subjects:
+  - kind: ServiceAccount
+    name: nanoclaw-orchestrator
+    namespace: nanoclaw
