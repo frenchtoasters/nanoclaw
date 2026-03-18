@@ -1,210 +1,172 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { EventEmitter } from 'events';
-import { PassThrough } from 'stream';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Sentinel markers must match container-runner.ts
-const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
-const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+// ---------------------------------------------------------------------------
+// Mocks — must be declared before imports
+// ---------------------------------------------------------------------------
 
-// Mock config
-vi.mock('./config.js', () => ({
-  CONTAINER_IMAGE: 'nanoclaw-agent:latest',
-  CONTAINER_MAX_OUTPUT_SIZE: 10485760,
-  CONTAINER_TIMEOUT: 1800000, // 30min
-  CREDENTIAL_PROXY_PORT: 3001,
-  DATA_DIR: '/tmp/nanoclaw-test-data',
-  GROUPS_DIR: '/tmp/nanoclaw-test-groups',
-  IDLE_TIMEOUT: 1800000, // 30min
-  TIMEZONE: 'America/Los_Angeles',
+// Mock container-runtime (K8s client)
+const mockCreateNamespacedJob = vi.fn();
+const mockReadNamespacedJob = vi.fn();
+const mockListNamespacedPod = vi.fn();
+const mockReadNamespacedPodLog = vi.fn();
+const mockCreateNamespacedConfigMap = vi.fn();
+const mockReplaceNamespacedConfigMap = vi.fn();
+const mockReadNamespacedConfigMap = vi.fn();
+
+vi.mock('./container-runtime.js', () => ({
+  getBatchApi: () => ({
+    createNamespacedJob: mockCreateNamespacedJob,
+    readNamespacedJob: mockReadNamespacedJob,
+  }),
+  getCoreApi: () => ({
+    listNamespacedPod: mockListNamespacedPod,
+    readNamespacedPodLog: mockReadNamespacedPodLog,
+    createNamespacedConfigMap: mockCreateNamespacedConfigMap,
+    replaceNamespacedConfigMap: mockReplaceNamespacedConfigMap,
+    readNamespacedConfigMap: mockReadNamespacedConfigMap,
+  }),
 }));
 
-// Mock logger
+vi.mock('./config.js', () => ({
+  AGENT_IMAGE: 'test-agent:latest',
+  ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
+  ASSISTANT_NAME: 'TestBot',
+  CONTAINER_TIMEOUT: 300000,
+  GROUPS_DIR: '/tmp/groups',
+  JOB_ACTIVE_DEADLINE: 1800,
+  JOB_CPU_LIMIT: '2',
+  JOB_CPU_REQUEST: '0.5',
+  JOB_MEMORY_LIMIT: '4Gi',
+  JOB_MEMORY_REQUEST: '1Gi',
+  JOB_TTL_SECONDS: 600,
+  K8S_NAMESPACE: 'test-ns',
+  TIMEZONE: 'UTC',
+}));
+
 vi.mock('./logger.js', () => ({
-  logger: {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+
+vi.mock('fs', () => ({
+  default: {
+    readFileSync: vi.fn().mockReturnValue('# Test CLAUDE.md'),
+    existsSync: vi.fn().mockReturnValue(true),
   },
 }));
 
-// Mock fs
-vi.mock('fs', async () => {
-  const actual = await vi.importActual<typeof import('fs')>('fs');
-  return {
-    ...actual,
-    default: {
-      ...actual,
-      existsSync: vi.fn(() => false),
-      mkdirSync: vi.fn(),
-      writeFileSync: vi.fn(),
-      readFileSync: vi.fn(() => ''),
-      readdirSync: vi.fn(() => []),
-      statSync: vi.fn(() => ({ isDirectory: () => false })),
-      copyFileSync: vi.fn(),
-    },
-  };
-});
-
-// Mock mount-security
-vi.mock('./mount-security.js', () => ({
-  validateAdditionalMounts: vi.fn(() => []),
-}));
-
-// Create a controllable fake ChildProcess
-function createFakeProcess() {
-  const proc = new EventEmitter() as EventEmitter & {
-    stdin: PassThrough;
-    stdout: PassThrough;
-    stderr: PassThrough;
-    kill: ReturnType<typeof vi.fn>;
-    pid: number;
-  };
-  proc.stdin = new PassThrough();
-  proc.stdout = new PassThrough();
-  proc.stderr = new PassThrough();
-  proc.kill = vi.fn();
-  proc.pid = 12345;
-  return proc;
-}
-
-let fakeProc: ReturnType<typeof createFakeProcess>;
-
-// Mock child_process.spawn
-vi.mock('child_process', async () => {
-  const actual =
-    await vi.importActual<typeof import('child_process')>('child_process');
-  return {
-    ...actual,
-    spawn: vi.fn(() => fakeProc),
-    exec: vi.fn(
-      (_cmd: string, _opts: unknown, cb?: (err: Error | null) => void) => {
-        if (cb) cb(null);
-        return new EventEmitter();
-      },
-    ),
-  };
-});
-
-import { runContainerAgent, ContainerOutput } from './container-runner.js';
+// ---------------------------------------------------------------------------
+// Import after mocks
+// ---------------------------------------------------------------------------
+import {
+  runContainerAgent,
+  ContainerInput,
+  ContainerOutput,
+} from './container-runner.js';
 import type { RegisteredGroup } from './types.js';
 
 const testGroup: RegisteredGroup = {
   name: 'Test Group',
   folder: 'test-group',
-  trigger: '@Andy',
+  trigger: 'always',
   added_at: new Date().toISOString(),
+  requiresTrigger: false,
+  isMain: true,
 };
 
-const testInput = {
-  prompt: 'Hello',
+const testInput: ContainerInput = {
   groupFolder: 'test-group',
   chatJid: 'test@g.us',
-  isMain: false,
+  input: 'Hello, agent!',
+  registeredGroup: testGroup,
+  assistantName: 'TestBot',
 };
 
-function emitOutputMarker(
-  proc: ReturnType<typeof createFakeProcess>,
-  output: ContainerOutput,
-) {
-  const json = JSON.stringify(output);
-  proc.stdout.push(`${OUTPUT_START_MARKER}\n${json}\n${OUTPUT_END_MARKER}\n`);
-}
+beforeEach(() => {
+  vi.clearAllMocks();
+});
 
-describe('container-runner timeout behavior', () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    fakeProc = createFakeProcess();
-  });
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+describe('container-runner (K8s Jobs)', () => {
+  it('creates a Job and returns output on success', async () => {
+    // ConfigMap create succeeds (new)
+    mockReadNamespacedConfigMap.mockRejectedValueOnce({ statusCode: 404 });
+    mockCreateNamespacedConfigMap.mockResolvedValueOnce({});
 
-  afterEach(() => {
-    vi.useRealTimers();
-  });
+    // Job creation succeeds
+    mockCreateNamespacedJob.mockResolvedValueOnce({});
 
-  it('timeout after output resolves as success', async () => {
-    const onOutput = vi.fn(async () => {});
-    const resultPromise = runContainerAgent(
-      testGroup,
-      testInput,
-      () => {},
-      onOutput,
-    );
+    // Job completes successfully after polling
+    mockReadNamespacedJob
+      .mockResolvedValueOnce({
+        body: { status: { succeeded: undefined, failed: undefined } },
+      })
+      .mockResolvedValueOnce({
+        body: { status: { succeeded: 1 } },
+      });
 
-    // Emit output with a result
-    emitOutputMarker(fakeProc, {
-      status: 'success',
-      result: 'Here is my response',
-      newSessionId: 'session-123',
+    // Pod list for log retrieval
+    mockListNamespacedPod.mockResolvedValueOnce({
+      body: { items: [{ metadata: { name: 'test-pod' } }] },
     });
 
-    // Let output processing settle
-    await vi.advanceTimersByTimeAsync(10);
+    // Pod logs with output markers
+    const logOutput = [
+      'Starting agent...',
+      '---OUTPUT_START---',
+      JSON.stringify({
+        response: 'Hello from agent!',
+        sessionId: 'sess-123',
+      }),
+      '---OUTPUT_END---',
+      'Agent finished.',
+    ].join('\n');
+    mockReadNamespacedPodLog.mockResolvedValueOnce({ body: logOutput });
 
-    // Fire the hard timeout (IDLE_TIMEOUT + 30s = 1830000ms)
-    await vi.advanceTimersByTimeAsync(1830000);
+    const result = await runContainerAgent(testInput);
 
-    // Emit close event (as if container was stopped by the timeout)
-    fakeProc.emit('close', 137);
-
-    // Let the promise resolve
-    await vi.advanceTimersByTimeAsync(10);
-
-    const result = await resultPromise;
-    expect(result.status).toBe('success');
-    expect(result.newSessionId).toBe('session-123');
-    expect(onOutput).toHaveBeenCalledWith(
-      expect.objectContaining({ result: 'Here is my response' }),
-    );
+    expect(result.response).toBe('Hello from agent!');
+    expect(result.sessionId).toBe('sess-123');
+    expect(result.exitCode).toBe(0);
+    expect(mockCreateNamespacedJob).toHaveBeenCalledOnce();
   });
 
-  it('timeout with no output resolves as error', async () => {
-    const onOutput = vi.fn(async () => {});
-    const resultPromise = runContainerAgent(
-      testGroup,
-      testInput,
-      () => {},
-      onOutput,
-    );
+  it('returns error output when Job fails', async () => {
+    // ConfigMap already exists → update
+    mockReadNamespacedConfigMap.mockResolvedValueOnce({});
+    mockReplaceNamespacedConfigMap.mockResolvedValueOnce({});
 
-    // No output emitted — fire the hard timeout
-    await vi.advanceTimersByTimeAsync(1830000);
+    // Job creation succeeds
+    mockCreateNamespacedJob.mockResolvedValueOnce({});
 
-    // Emit close event
-    fakeProc.emit('close', 137);
-
-    await vi.advanceTimersByTimeAsync(10);
-
-    const result = await resultPromise;
-    expect(result.status).toBe('error');
-    expect(result.error).toContain('timed out');
-    expect(onOutput).not.toHaveBeenCalled();
-  });
-
-  it('normal exit after output resolves as success', async () => {
-    const onOutput = vi.fn(async () => {});
-    const resultPromise = runContainerAgent(
-      testGroup,
-      testInput,
-      () => {},
-      onOutput,
-    );
-
-    // Emit output
-    emitOutputMarker(fakeProc, {
-      status: 'success',
-      result: 'Done',
-      newSessionId: 'session-456',
+    // Job fails
+    mockReadNamespacedJob.mockResolvedValueOnce({
+      body: { status: { failed: 1 } },
     });
 
-    await vi.advanceTimersByTimeAsync(10);
+    // Pod list for log retrieval
+    mockListNamespacedPod.mockResolvedValueOnce({
+      body: { items: [{ metadata: { name: 'fail-pod' } }] },
+    });
 
-    // Normal exit (no timeout)
-    fakeProc.emit('close', 0);
+    // Pod logs without output markers
+    mockReadNamespacedPodLog.mockResolvedValueOnce({
+      body: 'Error: something went wrong',
+    });
 
-    await vi.advanceTimersByTimeAsync(10);
+    const result = await runContainerAgent(testInput);
 
-    const result = await resultPromise;
-    expect(result.status).toBe('success');
-    expect(result.newSessionId).toBe('session-456');
+    expect(result.response).toBe('');
+    expect(result.exitCode).toBe(1);
+    expect(result.logs).toContain('something went wrong');
+  });
+
+  it('writeTasksSnapshot and writeGroupsSnapshot are no-ops', async () => {
+    const { writeTasksSnapshot, writeGroupsSnapshot } =
+      await import('./container-runner.js');
+    // Should not throw
+    await writeTasksSnapshot('folder', {});
+    await writeGroupsSnapshot([]);
   });
 });

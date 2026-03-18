@@ -1,8 +1,11 @@
-import { ChildProcess } from 'child_process';
-import fs from 'fs';
-import path from 'path';
-
-import { DATA_DIR, MAX_CONCURRENT_CONTAINERS } from './config.js';
+/**
+ * Group Queue for NanoClaw — Kubernetes Edition.
+ * Manages per-group concurrency for K8s Job-based agent execution.
+ *
+ * In K8s mode, there's no ChildProcess to track — Jobs run independently.
+ * The queue still enforces MAX_CONCURRENT_CONTAINERS and task ordering.
+ */
+import { MAX_CONCURRENT_CONTAINERS } from './config.js';
 import { logger } from './logger.js';
 
 interface QueuedTask {
@@ -21,8 +24,7 @@ interface GroupState {
   runningTaskId: string | null;
   pendingMessages: boolean;
   pendingTasks: QueuedTask[];
-  process: ChildProcess | null;
-  containerName: string | null;
+  jobName: string | null;
   groupFolder: string | null;
   retryCount: number;
 }
@@ -45,8 +47,7 @@ export class GroupQueue {
         runningTaskId: null,
         pendingMessages: false,
         pendingTasks: [],
-        process: null,
-        containerName: null,
+        jobName: null,
         groupFolder: null,
         retryCount: 0,
       };
@@ -66,7 +67,7 @@ export class GroupQueue {
 
     if (state.active) {
       state.pendingMessages = true;
-      logger.debug({ groupJid }, 'Container active, message queued');
+      logger.debug({ groupJid }, 'Job active, message queued');
       return;
     }
 
@@ -104,10 +105,7 @@ export class GroupQueue {
 
     if (state.active) {
       state.pendingTasks.push({ id: taskId, groupJid, fn });
-      if (state.idleWaiting) {
-        this.closeStdin(groupJid);
-      }
-      logger.debug({ groupJid, taskId }, 'Container active, task queued');
+      logger.debug({ groupJid, taskId }, 'Job active, task queued');
       return;
     }
 
@@ -129,68 +127,43 @@ export class GroupQueue {
     );
   }
 
-  registerProcess(
-    groupJid: string,
-    proc: ChildProcess,
-    containerName: string,
-    groupFolder?: string,
-  ): void {
+  /**
+   * Register the K8s Job name for a running group.
+   * In K8s mode, this replaces the Docker ChildProcess registration.
+   */
+  registerJob(groupJid: string, jobName: string, groupFolder?: string): void {
     const state = this.getGroup(groupJid);
-    state.process = proc;
-    state.containerName = containerName;
+    state.jobName = jobName;
     if (groupFolder) state.groupFolder = groupFolder;
   }
 
   /**
    * Mark the container as idle-waiting (finished work, waiting for IPC input).
-   * If tasks are pending, preempt the idle container immediately.
+   * If tasks are pending, mark for preemption.
    */
   notifyIdle(groupJid: string): void {
     const state = this.getGroup(groupJid);
     state.idleWaiting = true;
-    if (state.pendingTasks.length > 0) {
-      this.closeStdin(groupJid);
-    }
+    // In K8s mode, Jobs are one-shot — they don't sit idle.
+    // Pending tasks will run as new Jobs once the current one completes.
   }
 
   /**
-   * Send a follow-up message to the active container via IPC file.
-   * Returns true if the message was written, false if no active container.
+   * No-op in K8s mode. In Docker mode this wrote IPC files to pipe messages
+   * to an active container. In K8s mode, follow-up messages create new Jobs.
+   * Returns false since there's no active container to pipe to.
    */
-  sendMessage(groupJid: string, text: string): boolean {
-    const state = this.getGroup(groupJid);
-    if (!state.active || !state.groupFolder || state.isTaskContainer)
-      return false;
-    state.idleWaiting = false; // Agent is about to receive work, no longer idle
-
-    const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
-    try {
-      fs.mkdirSync(inputDir, { recursive: true });
-      const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
-      const filepath = path.join(inputDir, filename);
-      const tempPath = `${filepath}.tmp`;
-      fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text }));
-      fs.renameSync(tempPath, filepath);
-      return true;
-    } catch {
-      return false;
-    }
+  sendMessage(_groupJid: string, _text: string): boolean {
+    // K8s Jobs are one-shot. Messages create new Jobs via enqueueMessageCheck.
+    return false;
   }
 
   /**
-   * Signal the active container to wind down by writing a close sentinel.
+   * No-op in K8s mode. In Docker mode this wrote a close sentinel.
+   * K8s Jobs have activeDeadlineSeconds and TTL for lifecycle management.
    */
-  closeStdin(groupJid: string): void {
-    const state = this.getGroup(groupJid);
-    if (!state.active || !state.groupFolder) return;
-
-    const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
-    try {
-      fs.mkdirSync(inputDir, { recursive: true });
-      fs.writeFileSync(path.join(inputDir, '_close'), '');
-    } catch {
-      // ignore
-    }
+  closeStdin(_groupJid: string): void {
+    // K8s Jobs are one-shot — no stdin to close.
   }
 
   private async runForGroup(
@@ -206,7 +179,7 @@ export class GroupQueue {
 
     logger.debug(
       { groupJid, reason, activeCount: this.activeCount },
-      'Starting container for group',
+      'Starting K8s Job for group',
     );
 
     try {
@@ -223,8 +196,7 @@ export class GroupQueue {
       this.scheduleRetry(groupJid, state);
     } finally {
       state.active = false;
-      state.process = null;
-      state.containerName = null;
+      state.jobName = null;
       state.groupFolder = null;
       this.activeCount--;
       this.drainGroup(groupJid);
@@ -241,7 +213,7 @@ export class GroupQueue {
 
     logger.debug(
       { groupJid, taskId: task.id, activeCount: this.activeCount },
-      'Running queued task',
+      'Running queued task via K8s Job',
     );
 
     try {
@@ -252,8 +224,7 @@ export class GroupQueue {
       state.active = false;
       state.isTaskContainer = false;
       state.runningTaskId = null;
-      state.process = null;
-      state.containerName = null;
+      state.jobName = null;
       state.groupFolder = null;
       this.activeCount--;
       this.drainGroup(groupJid);
@@ -288,7 +259,7 @@ export class GroupQueue {
 
     const state = this.getGroup(groupJid);
 
-    // Tasks first (they won't be re-discovered from SQLite like messages)
+    // Tasks first (they won't be re-discovered from DB like messages)
     if (state.pendingTasks.length > 0) {
       const task = state.pendingTasks.shift()!;
       this.runTask(groupJid, task).catch((err) =>
@@ -347,19 +318,18 @@ export class GroupQueue {
   async shutdown(_gracePeriodMs: number): Promise<void> {
     this.shuttingDown = true;
 
-    // Count active containers but don't kill them — they'll finish on their own
-    // via idle timeout or container timeout. The --rm flag cleans them up on exit.
-    // This prevents WhatsApp reconnection restarts from killing working agents.
-    const activeContainers: string[] = [];
-    for (const [jid, state] of this.groups) {
-      if (state.process && !state.process.killed && state.containerName) {
-        activeContainers.push(state.containerName);
+    // In K8s mode, Jobs are independent — they'll finish on their own
+    // via activeDeadlineSeconds or TTL. No process killing needed.
+    const activeJobs: string[] = [];
+    for (const [_jid, state] of this.groups) {
+      if (state.active && state.jobName) {
+        activeJobs.push(state.jobName);
       }
     }
 
     logger.info(
-      { activeCount: this.activeCount, detachedContainers: activeContainers },
-      'GroupQueue shutting down (containers detached, not killed)',
+      { activeCount: this.activeCount, detachedJobs: activeJobs },
+      'GroupQueue shutting down (K8s Jobs detached, not deleted)',
     );
   }
 }

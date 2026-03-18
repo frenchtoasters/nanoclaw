@@ -1,455 +1,509 @@
-import fs from 'fs';
-import path from 'path';
+/**
+ * IPC (Inter-Process Communication) for NanoClaw — PostgreSQL LISTEN/NOTIFY Edition
+ *
+ * Agent K8s Jobs write commands to the `ipc_commands` table and call pg_notify('ipc').
+ * The orchestrator listens on the `ipc` channel and processes commands as they arrive.
+ */
+import pg from 'pg';
 
-import { CronExpressionParser } from 'cron-parser';
-
-import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
-import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import {
+  createTask,
+  deleteTask,
+  getPool,
+  getTaskById,
+  updateTask,
+} from './db.js';
+import { DATABASE_URL } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import { RegisteredGroup } from './types.js';
+import { RegisteredGroup, ScheduledTask } from './types.js';
+import { computeNextRun } from './task-scheduler.js';
+import { AvailableGroup } from './container-runner.js';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 export interface IpcDeps {
-  sendMessage: (jid: string, text: string) => Promise<void>;
-  registeredGroups: () => Record<string, RegisteredGroup>;
-  registerGroup: (jid: string, group: RegisteredGroup) => void;
-  syncGroups: (force: boolean) => Promise<void>;
-  getAvailableGroups: () => AvailableGroup[];
-  writeGroupsSnapshot: (
+  sendMessage: (
     groupFolder: string,
-    isMain: boolean,
-    availableGroups: AvailableGroup[],
-    registeredJids: Set<string>,
-  ) => void;
+    chatJid: string,
+    text: string,
+  ) => Promise<void>;
+  registeredGroups: () => Record<string, RegisteredGroup>;
+  registerGroup: (jid: string, name: string, folder: string) => Promise<void>;
+  syncGroups: () => Promise<void>;
+  getAvailableGroups: () => AvailableGroup[];
+  writeGroupsSnapshot: (groups: AvailableGroup[]) => Promise<void>;
 }
 
-let ipcWatcherRunning = false;
+// ---------------------------------------------------------------------------
+// Schema
+// ---------------------------------------------------------------------------
 
-export function startIpcWatcher(deps: IpcDeps): void {
-  if (ipcWatcherRunning) {
-    logger.debug('IPC watcher already running, skipping duplicate start');
+let listenerClient: pg.Client | null = null;
+
+async function ensureIpcSchema(): Promise<void> {
+  const pool = getPool();
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ipc_commands (
+      id SERIAL PRIMARY KEY,
+      group_folder TEXT NOT NULL,
+      command_type TEXT NOT NULL,
+      payload JSONB NOT NULL,
+      processed BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_ipc_unprocessed
+      ON ipc_commands(processed) WHERE processed = FALSE;
+  `);
+}
+
+// ---------------------------------------------------------------------------
+// Command processing
+// ---------------------------------------------------------------------------
+
+/** Drain all unprocessed IPC commands from the database */
+async function processIpcCommands(deps: IpcDeps): Promise<void> {
+  const pool = getPool();
+
+  const { rows } = await pool.query(
+    `SELECT * FROM ipc_commands WHERE processed = FALSE ORDER BY id ASC LIMIT 100`,
+  );
+
+  for (const row of rows) {
+    try {
+      if (row.command_type === 'message') {
+        await processMessageIpc(deps, row.group_folder, row.payload);
+      } else {
+        await processTaskIpc(
+          deps,
+          row.group_folder,
+          row.command_type,
+          row.payload,
+        );
+      }
+    } catch (err) {
+      logger.error(
+        { id: row.id, command_type: row.command_type, err },
+        'Failed to process IPC command',
+      );
+    }
+    // Mark processed regardless — failed commands are logged, not retried forever
+    await pool.query('UPDATE ipc_commands SET processed = TRUE WHERE id = $1', [
+      row.id,
+    ]);
+  }
+}
+
+/** Route an outbound message from agent to channel */
+async function processMessageIpc(
+  deps: IpcDeps,
+  groupFolder: string,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  const chatJid =
+    (payload.chatJid as string) ?? (payload.chat_jid as string) ?? '';
+  const text =
+    (payload.text as string) ??
+    (payload.content as string) ??
+    (payload.message as string) ??
+    '';
+
+  if (!chatJid || !text) {
+    logger.warn(
+      { groupFolder, payload },
+      'Invalid message IPC: missing chatJid or text',
+    );
     return;
   }
-  ipcWatcherRunning = true;
 
-  const ipcBaseDir = path.join(DATA_DIR, 'ipc');
-  fs.mkdirSync(ipcBaseDir, { recursive: true });
-
-  const processIpcFiles = async () => {
-    // Scan all group IPC directories (identity determined by directory)
-    let groupFolders: string[];
-    try {
-      groupFolders = fs.readdirSync(ipcBaseDir).filter((f) => {
-        const stat = fs.statSync(path.join(ipcBaseDir, f));
-        return stat.isDirectory() && f !== 'errors';
-      });
-    } catch (err) {
-      logger.error({ err }, 'Error reading IPC base directory');
-      setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
-      return;
-    }
-
-    const registeredGroups = deps.registeredGroups();
-
-    // Build folder→isMain lookup from registered groups
-    const folderIsMain = new Map<string, boolean>();
-    for (const group of Object.values(registeredGroups)) {
-      if (group.isMain) folderIsMain.set(group.folder, true);
-    }
-
-    for (const sourceGroup of groupFolders) {
-      const isMain = folderIsMain.get(sourceGroup) === true;
-      const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
-      const tasksDir = path.join(ipcBaseDir, sourceGroup, 'tasks');
-
-      // Process messages from this group's IPC directory
-      try {
-        if (fs.existsSync(messagesDir)) {
-          const messageFiles = fs
-            .readdirSync(messagesDir)
-            .filter((f) => f.endsWith('.json'));
-          for (const file of messageFiles) {
-            const filePath = path.join(messagesDir, file);
-            try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'message' && data.chatJid && data.text) {
-                // Authorization: verify this group can send to this chatJid
-                const targetGroup = registeredGroups[data.chatJid];
-                if (
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
-                ) {
-                  await deps.sendMessage(data.chatJid, data.text);
-                  logger.info(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'IPC message sent',
-                  );
-                } else {
-                  logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'Unauthorized IPC message attempt blocked',
-                  );
-                }
-              }
-              fs.unlinkSync(filePath);
-            } catch (err) {
-              logger.error(
-                { file, sourceGroup, err },
-                'Error processing IPC message',
-              );
-              const errorDir = path.join(ipcBaseDir, 'errors');
-              fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(
-                filePath,
-                path.join(errorDir, `${sourceGroup}-${file}`),
-              );
-            }
-          }
-        }
-      } catch (err) {
-        logger.error(
-          { err, sourceGroup },
-          'Error reading IPC messages directory',
-        );
-      }
-
-      // Process tasks from this group's IPC directory
-      try {
-        if (fs.existsSync(tasksDir)) {
-          const taskFiles = fs
-            .readdirSync(tasksDir)
-            .filter((f) => f.endsWith('.json'));
-          for (const file of taskFiles) {
-            const filePath = path.join(tasksDir, file);
-            try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              // Pass source group identity to processTaskIpc for authorization
-              await processTaskIpc(data, sourceGroup, isMain, deps);
-              fs.unlinkSync(filePath);
-            } catch (err) {
-              logger.error(
-                { file, sourceGroup, err },
-                'Error processing IPC task',
-              );
-              const errorDir = path.join(ipcBaseDir, 'errors');
-              fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(
-                filePath,
-                path.join(errorDir, `${sourceGroup}-${file}`),
-              );
-            }
-          }
-        }
-      } catch (err) {
-        logger.error({ err, sourceGroup }, 'Error reading IPC tasks directory');
-      }
-    }
-
-    setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
-  };
-
-  processIpcFiles();
-  logger.info('IPC watcher started (per-group namespaces)');
+  await deps.sendMessage(groupFolder, chatJid, text);
+  logger.info({ groupFolder, chatJid }, 'Routed IPC message to channel');
 }
 
+/** Check if a group folder belongs to the main (elevated) group */
+function isMainGroup(groupFolder: string, deps: IpcDeps): boolean {
+  const groups = deps.registeredGroups();
+  for (const group of Object.values(groups)) {
+    if (group.folder === groupFolder && group.isMain) return true;
+  }
+  return false;
+}
+
+/** Process a task-related IPC command */
 export async function processTaskIpc(
-  data: {
-    type: string;
-    taskId?: string;
-    prompt?: string;
-    schedule_type?: string;
-    schedule_value?: string;
-    context_mode?: string;
-    groupFolder?: string;
-    chatJid?: string;
-    targetJid?: string;
-    // For register_group
-    jid?: string;
-    name?: string;
-    folder?: string;
-    trigger?: string;
-    requiresTrigger?: boolean;
-    containerConfig?: RegisteredGroup['containerConfig'];
-  },
-  sourceGroup: string, // Verified identity from IPC directory
-  isMain: boolean, // Verified from directory path
   deps: IpcDeps,
+  groupFolder: string,
+  commandType: string,
+  payload: Record<string, unknown>,
 ): Promise<void> {
-  const registeredGroups = deps.registeredGroups();
+  const isMain = isMainGroup(groupFolder, deps);
 
-  switch (data.type) {
-    case 'schedule_task':
-      if (
-        data.prompt &&
-        data.schedule_type &&
-        data.schedule_value &&
-        data.targetJid
-      ) {
-        // Resolve the target group from JID
-        const targetJid = data.targetJid as string;
-        const targetGroupEntry = registeredGroups[targetJid];
+  switch (commandType) {
+    case 'schedule_task': {
+      // Resolve target group from targetJid
+      const targetJid =
+        (payload.targetJid as string) ?? (payload.target_jid as string);
+      let targetFolder = groupFolder;
+      let targetChatJid =
+        (payload.chat_jid as string) ?? (payload.chatJid as string) ?? '';
 
-        if (!targetGroupEntry) {
+      if (targetJid) {
+        const groups = deps.registeredGroups();
+        const targetGroup = groups[targetJid];
+        if (!targetGroup) {
           logger.warn(
-            { targetJid },
-            'Cannot schedule task: target group not registered',
+            { targetJid, groupFolder },
+            'schedule_task: target JID not registered',
           );
           break;
         }
-
-        const targetFolder = targetGroupEntry.folder;
-
-        // Authorization: non-main groups can only schedule for themselves
-        if (!isMain && targetFolder !== sourceGroup) {
+        // Authorization: non-main can only schedule for own group
+        if (!isMain && targetGroup.folder !== groupFolder) {
           logger.warn(
-            { sourceGroup, targetFolder },
-            'Unauthorized schedule_task attempt blocked',
+            { targetJid, groupFolder },
+            'schedule_task: unauthorized cross-group',
           );
           break;
         }
-
-        const scheduleType = data.schedule_type as 'cron' | 'interval' | 'once';
-
-        let nextRun: string | null = null;
-        if (scheduleType === 'cron') {
-          try {
-            const interval = CronExpressionParser.parse(data.schedule_value, {
-              tz: TIMEZONE,
-            });
-            nextRun = interval.next().toISOString();
-          } catch {
-            logger.warn(
-              { scheduleValue: data.schedule_value },
-              'Invalid cron expression',
-            );
-            break;
-          }
-        } else if (scheduleType === 'interval') {
-          const ms = parseInt(data.schedule_value, 10);
-          if (isNaN(ms) || ms <= 0) {
-            logger.warn(
-              { scheduleValue: data.schedule_value },
-              'Invalid interval',
-            );
-            break;
-          }
-          nextRun = new Date(Date.now() + ms).toISOString();
-        } else if (scheduleType === 'once') {
-          const date = new Date(data.schedule_value);
-          if (isNaN(date.getTime())) {
-            logger.warn(
-              { scheduleValue: data.schedule_value },
-              'Invalid timestamp',
-            );
-            break;
-          }
-          nextRun = date.toISOString();
-        }
-
-        const taskId =
-          data.taskId ||
-          `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        const contextMode =
-          data.context_mode === 'group' || data.context_mode === 'isolated'
-            ? data.context_mode
-            : 'isolated';
-        createTask({
-          id: taskId,
-          group_folder: targetFolder,
-          chat_jid: targetJid,
-          prompt: data.prompt,
-          schedule_type: scheduleType,
-          schedule_value: data.schedule_value,
-          context_mode: contextMode,
-          next_run: nextRun,
-          status: 'active',
-          created_at: new Date().toISOString(),
-        });
-        logger.info(
-          { taskId, sourceGroup, targetFolder, contextMode },
-          'Task created via IPC',
-        );
+        targetFolder = targetGroup.folder;
+        if (!targetChatJid) targetChatJid = targetJid;
       }
-      break;
 
-    case 'pause_task':
-      if (data.taskId) {
-        const task = getTaskById(data.taskId);
-        if (task && (isMain || task.group_folder === sourceGroup)) {
-          updateTask(data.taskId, { status: 'paused' });
-          logger.info(
-            { taskId: data.taskId, sourceGroup },
-            'Task paused via IPC',
-          );
-        } else {
-          logger.warn(
-            { taskId: data.taskId, sourceGroup },
-            'Unauthorized task pause attempt',
-          );
-        }
-      }
-      break;
+      // Validate schedule
+      const scheduleType = ((payload.schedule_type as string) ??
+        (payload.scheduleType as string) ??
+        'once') as ScheduledTask['schedule_type'];
+      const scheduleValue =
+        (payload.schedule_value as string) ??
+        (payload.scheduleValue as string) ??
+        '';
 
-    case 'resume_task':
-      if (data.taskId) {
-        const task = getTaskById(data.taskId);
-        if (task && (isMain || task.group_folder === sourceGroup)) {
-          updateTask(data.taskId, { status: 'active' });
-          logger.info(
-            { taskId: data.taskId, sourceGroup },
-            'Task resumed via IPC',
-          );
-        } else {
-          logger.warn(
-            { taskId: data.taskId, sourceGroup },
-            'Unauthorized task resume attempt',
-          );
-        }
-      }
-      break;
+      // Validate context_mode
+      const rawContextMode =
+        (payload.context_mode as string) ??
+        (payload.contextMode as string) ??
+        'isolated';
+      const contextMode =
+        rawContextMode === 'group' || rawContextMode === 'isolated'
+          ? rawContextMode
+          : 'isolated';
 
-    case 'cancel_task':
-      if (data.taskId) {
-        const task = getTaskById(data.taskId);
-        if (task && (isMain || task.group_folder === sourceGroup)) {
-          deleteTask(data.taskId);
-          logger.info(
-            { taskId: data.taskId, sourceGroup },
-            'Task cancelled via IPC',
-          );
-        } else {
-          logger.warn(
-            { taskId: data.taskId, sourceGroup },
-            'Unauthorized task cancel attempt',
-          );
-        }
-      }
-      break;
+      const task: Omit<ScheduledTask, 'last_run' | 'last_result'> = {
+        id:
+          (payload.id as string) ??
+          `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        group_folder: targetFolder,
+        chat_jid: targetChatJid,
+        prompt: (payload.prompt as string) ?? '',
+        schedule_type: scheduleType,
+        schedule_value: scheduleValue,
+        context_mode: contextMode as ScheduledTask['context_mode'],
+        next_run: null,
+        status: 'active',
+        created_at: new Date().toISOString(),
+      };
 
-    case 'update_task':
-      if (data.taskId) {
-        const task = getTaskById(data.taskId);
-        if (!task) {
-          logger.warn(
-            { taskId: data.taskId, sourceGroup },
-            'Task not found for update',
-          );
-          break;
-        }
-        if (!isMain && task.group_folder !== sourceGroup) {
-          logger.warn(
-            { taskId: data.taskId, sourceGroup },
-            'Unauthorized task update attempt',
-          );
-          break;
-        }
-
-        const updates: Parameters<typeof updateTask>[1] = {};
-        if (data.prompt !== undefined) updates.prompt = data.prompt;
-        if (data.schedule_type !== undefined)
-          updates.schedule_type = data.schedule_type as
-            | 'cron'
-            | 'interval'
-            | 'once';
-        if (data.schedule_value !== undefined)
-          updates.schedule_value = data.schedule_value;
-
-        // Recompute next_run if schedule changed
-        if (data.schedule_type || data.schedule_value) {
-          const updatedTask = {
-            ...task,
-            ...updates,
-          };
-          if (updatedTask.schedule_type === 'cron') {
-            try {
-              const interval = CronExpressionParser.parse(
-                updatedTask.schedule_value,
-                { tz: TIMEZONE },
-              );
-              updates.next_run = interval.next().toISOString();
-            } catch {
-              logger.warn(
-                { taskId: data.taskId, value: updatedTask.schedule_value },
-                'Invalid cron in task update',
-              );
-              break;
-            }
-          } else if (updatedTask.schedule_type === 'interval') {
-            const ms = parseInt(updatedTask.schedule_value, 10);
-            if (!isNaN(ms) && ms > 0) {
-              updates.next_run = new Date(Date.now() + ms).toISOString();
-            }
-          }
-        }
-
-        updateTask(data.taskId, updates);
-        logger.info(
-          { taskId: data.taskId, sourceGroup, updates },
-          'Task updated via IPC',
-        );
-      }
-      break;
-
-    case 'refresh_groups':
-      // Only main group can request a refresh
-      if (isMain) {
-        logger.info(
-          { sourceGroup },
-          'Group metadata refresh requested via IPC',
-        );
-        await deps.syncGroups(true);
-        // Write updated snapshot immediately
-        const availableGroups = deps.getAvailableGroups();
-        deps.writeGroupsSnapshot(
-          sourceGroup,
-          true,
-          availableGroups,
-          new Set(Object.keys(registeredGroups)),
-        );
-      } else {
+      const nextRun = computeNextRun({
+        ...task,
+        last_run: null,
+        last_result: null,
+      } as ScheduledTask);
+      if (nextRun === null && scheduleType !== 'once') {
         logger.warn(
-          { sourceGroup },
-          'Unauthorized refresh_groups attempt blocked',
-        );
-      }
-      break;
-
-    case 'register_group':
-      // Only main group can register new groups
-      if (!isMain) {
-        logger.warn(
-          { sourceGroup },
-          'Unauthorized register_group attempt blocked',
+          { groupFolder, scheduleType, scheduleValue },
+          'schedule_task: invalid schedule',
         );
         break;
       }
-      if (data.jid && data.name && data.folder && data.trigger) {
-        if (!isValidGroupFolder(data.folder)) {
+      // For 'once' type, validate the date
+      if (scheduleType === 'once') {
+        const d = new Date(scheduleValue);
+        if (isNaN(d.getTime())) {
           logger.warn(
-            { sourceGroup, folder: data.folder },
-            'Invalid register_group request - unsafe folder name',
+            { groupFolder, scheduleValue },
+            'schedule_task: invalid once timestamp',
           );
           break;
         }
-        // Defense in depth: agent cannot set isMain via IPC
-        deps.registerGroup(data.jid, {
-          name: data.name,
-          folder: data.folder,
-          trigger: data.trigger,
-          added_at: new Date().toISOString(),
-          containerConfig: data.containerConfig,
-          requiresTrigger: data.requiresTrigger,
-        });
+        task.next_run = d.toISOString();
       } else {
-        logger.warn(
-          { data },
-          'Invalid register_group request - missing required fields',
-        );
+        task.next_run = nextRun;
       }
+      // For cron, validate by checking if computeNextRun returned null
+      if (scheduleType === 'cron' && nextRun === null) {
+        logger.warn(
+          { groupFolder, scheduleValue },
+          'schedule_task: invalid cron expression',
+        );
+        break;
+      }
+      // For interval, validate numeric > 0
+      if (scheduleType === 'interval') {
+        const ms = Number(scheduleValue);
+        if (isNaN(ms) || ms <= 0) {
+          logger.warn(
+            { groupFolder, scheduleValue },
+            'schedule_task: invalid interval',
+          );
+          break;
+        }
+      }
+
+      await createTask(task);
+      logger.info({ taskId: task.id, groupFolder }, 'Scheduled task via IPC');
       break;
+    }
+
+    case 'pause_task': {
+      const taskId = taskIdFrom(payload);
+      const task = await getTaskById(taskId);
+      if (!task) {
+        logger.warn({ taskId }, 'pause_task: task not found');
+        break;
+      }
+      if (!isMain && task.group_folder !== groupFolder) {
+        logger.warn({ taskId, groupFolder }, 'pause_task: unauthorized');
+        break;
+      }
+      await updateTask(taskId, { status: 'paused' });
+      logger.info({ taskId }, 'Paused task via IPC');
+      break;
+    }
+
+    case 'resume_task': {
+      const taskId = taskIdFrom(payload);
+      const task = await getTaskById(taskId);
+      if (!task) {
+        logger.warn({ taskId }, 'resume_task: task not found');
+        break;
+      }
+      if (!isMain && task.group_folder !== groupFolder) {
+        logger.warn({ taskId, groupFolder }, 'resume_task: unauthorized');
+        break;
+      }
+      const nextRun = computeNextRun(task);
+      await updateTask(taskId, { status: 'active', next_run: nextRun });
+      logger.info({ taskId }, 'Resumed task via IPC');
+      break;
+    }
+
+    case 'cancel_task': {
+      const taskId = taskIdFrom(payload);
+      const task = await getTaskById(taskId);
+      if (!task) {
+        logger.warn({ taskId }, 'cancel_task: task not found');
+        break;
+      }
+      if (!isMain && task.group_folder !== groupFolder) {
+        logger.warn({ taskId, groupFolder }, 'cancel_task: unauthorized');
+        break;
+      }
+      await deleteTask(taskId);
+      logger.info({ taskId }, 'Cancelled task via IPC');
+      break;
+    }
+
+    case 'update_task': {
+      const taskId = taskIdFrom(payload);
+      const task = await getTaskById(taskId);
+      if (!task) {
+        logger.warn({ taskId }, 'update_task: task not found');
+        break;
+      }
+      if (!isMain && task.group_folder !== groupFolder) {
+        logger.warn({ taskId, groupFolder }, 'update_task: unauthorized');
+        break;
+      }
+
+      const updates: Partial<
+        Pick<
+          ScheduledTask,
+          'prompt' | 'schedule_type' | 'schedule_value' | 'next_run' | 'status'
+        >
+      > = {};
+      if (payload.prompt) updates.prompt = payload.prompt as string;
+      if (payload.schedule_type || payload.scheduleType)
+        updates.schedule_type = (payload.schedule_type ??
+          payload.scheduleType) as ScheduledTask['schedule_type'];
+      if (payload.schedule_value || payload.scheduleValue)
+        updates.schedule_value = (payload.schedule_value ??
+          payload.scheduleValue) as string;
+      if (payload.status)
+        updates.status = payload.status as ScheduledTask['status'];
+
+      await updateTask(taskId, updates);
+
+      // Recompute next_run if schedule changed
+      if (updates.schedule_type || updates.schedule_value) {
+        const updated = await getTaskById(taskId);
+        if (updated) {
+          const nextRun = computeNextRun(updated);
+          await updateTask(taskId, { next_run: nextRun });
+        }
+      }
+      logger.info({ taskId }, 'Updated task via IPC');
+      break;
+    }
+
+    case 'refresh_groups': {
+      if (!isMain) {
+        logger.warn({ groupFolder }, 'refresh_groups: unauthorized (not main)');
+        break;
+      }
+      await deps.syncGroups();
+      await deps.writeGroupsSnapshot(deps.getAvailableGroups());
+      logger.info('Refreshed groups via IPC');
+      break;
+    }
+
+    case 'register_group': {
+      if (!isMain) {
+        logger.warn({ groupFolder }, 'register_group: unauthorized (not main)');
+        break;
+      }
+      const jid = payload.jid as string;
+      const name = payload.name as string;
+      const folder = payload.folder as string;
+      if (!jid || !name || !folder) {
+        logger.warn({ payload }, 'register_group: missing required fields');
+        break;
+      }
+      if (!isValidGroupFolder(folder)) {
+        logger.warn({ folder }, 'register_group: invalid/unsafe folder path');
+        break;
+      }
+      await deps.registerGroup(jid, name, folder);
+      logger.info({ jid, name, folder }, 'Registered group via IPC');
+      break;
+    }
 
     default:
-      logger.warn({ type: data.type }, 'Unknown IPC task type');
+      logger.warn({ commandType, groupFolder }, 'Unknown IPC command type');
   }
+}
+
+/** Extract a task ID from various payload shapes */
+function taskIdFrom(payload: Record<string, unknown>): string {
+  return (
+    (payload.id as string) ??
+    (payload.taskId as string) ??
+    (payload.task_id as string) ??
+    ''
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Listener lifecycle
+// ---------------------------------------------------------------------------
+
+/**
+ * Start the IPC watcher using PostgreSQL LISTEN/NOTIFY.
+ * Returns a cleanup function to tear down the listener.
+ */
+export async function startIpcWatcher(deps: IpcDeps): Promise<() => void> {
+  await ensureIpcSchema();
+
+  // Drain any commands queued before we started
+  await processIpcCommands(deps);
+
+  // Dedicated client for LISTEN (cannot use pooled connections)
+  listenerClient = new pg.Client({ connectionString: DATABASE_URL });
+  await listenerClient.connect();
+
+  listenerClient.on('notification', async (msg) => {
+    if (msg.channel === 'ipc') {
+      try {
+        await processIpcCommands(deps);
+      } catch (err) {
+        logger.error(
+          { err },
+          'Error processing IPC commands after notification',
+        );
+      }
+    }
+  });
+
+  listenerClient.on('error', (err) => {
+    logger.error({ err }, 'IPC listener client error — attempting reconnect');
+    reconnectListener(deps);
+  });
+
+  await listenerClient.query('LISTEN ipc');
+  logger.info('IPC watcher started (PostgreSQL LISTEN/NOTIFY)');
+
+  // Fallback poll every 30 s in case a notification is missed
+  const fallbackPoll = setInterval(async () => {
+    try {
+      await processIpcCommands(deps);
+    } catch (err) {
+      logger.error({ err }, 'Error in IPC fallback poll');
+    }
+  }, 30_000);
+
+  return () => {
+    clearInterval(fallbackPoll);
+    if (listenerClient) {
+      listenerClient.end().catch(() => {});
+      listenerClient = null;
+    }
+  };
+}
+
+/** Reconnect the LISTEN client with exponential backoff */
+async function reconnectListener(deps: IpcDeps): Promise<void> {
+  if (listenerClient) {
+    try {
+      await listenerClient.end();
+    } catch {
+      /* ignore */
+    }
+    listenerClient = null;
+  }
+
+  let delay = 1000;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    try {
+      listenerClient = new pg.Client({ connectionString: DATABASE_URL });
+      await listenerClient.connect();
+
+      listenerClient.on('notification', async (msg) => {
+        if (msg.channel === 'ipc') {
+          try {
+            await processIpcCommands(deps);
+          } catch (err) {
+            logger.error(
+              { err },
+              'Error processing IPC commands after notification',
+            );
+          }
+        }
+      });
+
+      listenerClient.on('error', (err) => {
+        logger.error(
+          { err },
+          'IPC listener client error — attempting reconnect',
+        );
+        reconnectListener(deps);
+      });
+
+      await listenerClient.query('LISTEN ipc');
+      logger.info('IPC listener reconnected');
+
+      // Drain missed commands
+      await processIpcCommands(deps);
+      return;
+    } catch (err) {
+      logger.warn(
+        { err, attempt, delay },
+        'IPC listener reconnect failed, retrying…',
+      );
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay = Math.min(delay * 2, 30_000);
+    }
+  }
+
+  logger.error('IPC listener reconnect failed after 10 attempts');
 }
