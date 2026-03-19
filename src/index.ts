@@ -522,13 +522,13 @@ async function main(): Promise<void> {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: 'ok' }));
     } else if (req.url === '/readyz') {
-      // Readiness: at least one channel connected
-      const ready = channels.length > 0;
-      const code = ready ? 200 : 503;
-      res.writeHead(code, { 'Content-Type': 'application/json' });
+      // Readiness: orchestrator subsystems are running (DB, K8s, scheduler)
+      // Channels may be zero in a fresh deployment — that's still "ready"
+      // to accept configuration via IPC.
+      res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(
         JSON.stringify({
-          status: ready ? 'ready' : 'not_ready',
+          status: 'ready',
           channels: channels.length,
         }),
       );

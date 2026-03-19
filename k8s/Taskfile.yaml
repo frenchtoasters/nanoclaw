@@ -157,9 +157,10 @@ tasks:
         DOCKERFILE
       - echo "✓ Orchestrator image built."
     sources:
-      - dist/**/*
+      - src/**/*.ts
       - package.json
       - package-lock.json
+      - tsconfig.json
 
   # ─── Image loading ─────────────────────────────────────────────────
 
