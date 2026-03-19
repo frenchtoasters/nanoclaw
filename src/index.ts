@@ -1,4 +1,5 @@
 import fs from 'fs';
+import http from 'http';
 import path from 'path';
 
 import {
@@ -401,6 +402,7 @@ async function main(): Promise<void> {
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    healthServer.close();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
@@ -507,9 +509,37 @@ async function main(): Promise<void> {
     await channel.connect();
   }
   if (channels.length === 0) {
-    logger.fatal('No channels connected');
-    process.exit(1);
+    logger.warn(
+      'No channels connected — orchestrator will stay running and accept channels via IPC/API',
+    );
   }
+
+  // --- Health / readiness HTTP server for K8s probes ---
+  const HEALTH_PORT = parseInt(process.env.HEALTH_PORT || '8080', 10);
+  const healthServer = http.createServer((req, res) => {
+    if (req.url === '/healthz') {
+      // Liveness: process is alive and event loop isn't stuck
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok' }));
+    } else if (req.url === '/readyz') {
+      // Readiness: at least one channel connected
+      const ready = channels.length > 0;
+      const code = ready ? 200 : 503;
+      res.writeHead(code, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          status: ready ? 'ready' : 'not_ready',
+          channels: channels.length,
+        }),
+      );
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+  healthServer.listen(HEALTH_PORT, () => {
+    logger.info({ port: HEALTH_PORT }, 'Health server listening');
+  });
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
@@ -551,11 +581,17 @@ async function main(): Promise<void> {
   });
 
   queue.setProcessMessagesFn(processGroupMessages);
-  await recoverPendingMessages();
-  startMessageLoop().catch((err) => {
-    logger.fatal({ err }, 'Message loop crashed unexpectedly');
-    process.exit(1);
-  });
+  if (channels.length > 0) {
+    await recoverPendingMessages();
+    startMessageLoop().catch((err) => {
+      logger.fatal({ err }, 'Message loop crashed unexpectedly');
+      process.exit(1);
+    });
+  } else {
+    logger.info(
+      'Skipping message loop — no channels. Orchestrator is idle but healthy.',
+    );
+  }
 }
 
 // Guard: only run when executed directly, not when imported by tests

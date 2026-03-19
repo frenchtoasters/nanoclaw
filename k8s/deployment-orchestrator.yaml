@@ -60,6 +60,12 @@ spec:
               value: 1Gi
             - name: TZ
               value: UTC
+            - name: HEALTH_PORT
+              value: '8080'
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
           volumeMounts:
             - name: groups
               mountPath: /app/groups
@@ -73,13 +79,15 @@ spec:
               cpu: '1'
               memory: 512Mi
           livenessProbe:
-            exec:
-              command: ['node', '-e', 'process.exit(0)']
+            httpGet:
+              path: /healthz
+              port: health
             initialDelaySeconds: 10
             periodSeconds: 30
           readinessProbe:
-            exec:
-              command: ['node', '-e', 'process.exit(0)']
+            httpGet:
+              path: /readyz
+              port: health
             initialDelaySeconds: 5
             periodSeconds: 10
       volumes:
