@@ -26,6 +26,7 @@ spec:
       containers:
         - name: orchestrator
           image: nanoclaw-orchestrator:latest # Replace with your registry image
+          imagePullPolicy: IfNotPresent # Use 'Never' for kind; 'Always' for registry images
           command: ['node', 'dist/index.js']
           env:
             - name: DATABASE_URL

@@ -1,0 +1,362 @@
+# k8s/Taskfile.yaml — NanoClaw Kubernetes deployment tasks (go-task)
+#
+# Prerequisites: task, kind, kubectl, docker
+#
+# Quick start:
+#   task -d k8s up           # full setup (create cluster, build, deploy)
+#   task -d k8s deploy       # redeploy manifests + secrets (no rebuild)
+#   task -d k8s down         # delete kind cluster
+#   task -d k8s logs         # tail orchestrator logs
+#   task -d k8s status       # show pod/job status
+#
+# Or from repo root:
+#   task -t k8s/Taskfile.yaml up
+
+version: '3'
+
+vars:
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "nanoclaw"}}'
+  NAMESPACE: nanoclaw
+  REPO_ROOT:
+    sh: cd .. && pwd
+  AGENT_IMAGE: nanoclaw-agent:latest
+  ORCHESTRATOR_IMAGE: nanoclaw-orchestrator:latest
+
+tasks:
+  # ─── Top-level workflows ───────────────────────────────────────────
+
+  up:
+    desc: Full setup — create kind cluster, build images, deploy everything
+    cmds:
+      - task: check-prereqs
+      - task: cluster:create
+      - task: build
+      - task: images:load
+      - task: deploy
+
+  down:
+    desc: Delete the kind cluster
+    cmds:
+      - kind delete cluster --name "{{.CLUSTER_NAME}}" 2>/dev/null || true
+      - echo "✓ Cluster '{{.CLUSTER_NAME}}' deleted."
+
+  deploy:
+    desc: Apply manifests, create secrets, wait for rollout
+    cmds:
+      - task: manifests:apply
+      - task: secrets:create
+      - task: rollout:restart
+      - task: status:summary
+
+  redeploy:
+    desc: Rebuild images and redeploy (cluster must exist)
+    cmds:
+      - task: build
+      - task: images:load
+      - task: manifests:apply
+      - task: orchestrator:restart
+      - task: status:summary
+
+  # ─── Prerequisite checks ───────────────────────────────────────────
+
+  check-prereqs:
+    desc: Verify required CLI tools are installed
+    silent: true
+    cmds:
+      - |
+        for cmd in kind kubectl docker; do
+          if ! command -v "$cmd" &>/dev/null; then
+            echo "✗ $cmd is required but not found. Install it first." >&2
+            exit 1
+          fi
+        done
+        echo "✓ All prerequisites found (kind, kubectl, docker)."
+
+  # ─── Cluster management ────────────────────────────────────────────
+
+  cluster:create:
+    desc: Create kind cluster with hostPath mounts for RWX volumes
+    status:
+      - kind get clusters 2>/dev/null | grep -qx "{{.CLUSTER_NAME}}"
+    cmds:
+      - |
+        cat <<EOF | kind create cluster --name "{{.CLUSTER_NAME}}" --config=-
+        kind: Cluster
+        apiVersion: kind.x-k8s.io/v1alpha4
+        nodes:
+          - role: control-plane
+            kubeadmConfigPatches:
+              - |
+                kind: InitConfiguration
+                nodeRegistration:
+                  kubeletExtraArgs:
+                    node-labels: "ingress-ready=true"
+            extraPortMappings:
+              - containerPort: 30080
+                hostPort: 30080
+                protocol: TCP
+            # Mount host directories into the kind node for hostPath PVs.
+            # This provides ReadWriteMany-capable storage without NFS.
+            extraMounts:
+              - hostPath: {{.REPO_ROOT}}/.kind-data/global
+                containerPath: /data/nanoclaw/global
+                readOnly: false
+                propagation: None
+              - hostPath: {{.REPO_ROOT}}/.kind-data/groups
+                containerPath: /data/nanoclaw/groups
+                readOnly: false
+                propagation: None
+        EOF
+      - echo "✓ Kind cluster '{{.CLUSTER_NAME}}' created with hostPath mounts."
+    preconditions:
+      - sh: command -v kind
+        msg: kind is required
+
+  cluster:delete:
+    desc: Alias for 'down'
+    cmds:
+      - task: down
+
+  # ─── Image builds ──────────────────────────────────────────────────
+
+  build:
+    desc: Build both container images
+    cmds:
+      - task: build:agent
+      - task: build:orchestrator
+
+  build:agent:
+    desc: Build the agent container image
+    dir: '{{.REPO_ROOT}}'
+    cmds:
+      - echo "→ Building agent image ({{.AGENT_IMAGE}})..."
+      - docker build -t "{{.AGENT_IMAGE}}" container/
+      - echo "✓ Agent image built."
+    sources:
+      - container/Dockerfile
+      - container/**/*
+
+  build:orchestrator:
+    desc: Build the orchestrator container image
+    dir: '{{.REPO_ROOT}}'
+    cmds:
+      - mkdir -p groups
+      - touch .env
+      - npm run build
+      - |
+        docker build -t "{{.ORCHESTRATOR_IMAGE}}" -f- . <<'DOCKERFILE'
+        FROM node:22-slim
+        WORKDIR /app
+        COPY package*.json ./
+        RUN npm ci --omit=dev --ignore-scripts
+        COPY dist/ ./dist/
+        COPY groups/ ./groups/
+        COPY .env .env
+        USER node
+        CMD ["node", "dist/index.js"]
+        DOCKERFILE
+      - echo "✓ Orchestrator image built."
+    sources:
+      - dist/**/*
+      - package.json
+      - package-lock.json
+
+  # ─── Image loading ─────────────────────────────────────────────────
+
+  images:load:
+    desc: Load built images into kind cluster
+    cmds:
+      - echo "→ Loading images into kind cluster..."
+      - kind load docker-image "{{.AGENT_IMAGE}}" --name "{{.CLUSTER_NAME}}"
+      - kind load docker-image "{{.ORCHESTRATOR_IMAGE}}" --name "{{.CLUSTER_NAME}}"
+      - echo "✓ Images loaded into kind."
+
+  # ─── Manifest application ──────────────────────────────────────────
+
+  manifests:apply:
+    desc: Apply Kustomize manifests to the cluster
+    cmds:
+      - echo "→ Applying K8s manifests..."
+      - kubectl apply -k .
+      - echo "✓ Manifests applied."
+
+  # ─── Secrets ───────────────────────────────────────────────────────
+
+  secrets:create:
+    desc: Create both database and LLM secrets
+    cmds:
+      - task: secrets:db
+      - task: secrets:llm
+
+  secrets:db:
+    desc: Create nanoclaw-db Secret (Postgres credentials)
+    vars:
+      PG_USER: nanoclaw
+      PG_DB: nanoclaw
+      PG_PASS:
+        sh: openssl rand -base64 16 | tr -d '=/+'
+    status:
+      - kubectl get secret nanoclaw-db -n "{{.NAMESPACE}}" &>/dev/null
+    cmds:
+      - |
+        kubectl create secret generic nanoclaw-db \
+          --namespace="{{.NAMESPACE}}" \
+          --from-literal="DATABASE_URL=postgresql://{{.PG_USER}}:{{.PG_PASS}}@postgres.{{.NAMESPACE}}.svc.cluster.local:5432/{{.PG_DB}}" \
+          --from-literal="POSTGRES_USER={{.PG_USER}}" \
+          --from-literal="POSTGRES_PASSWORD={{.PG_PASS}}" \
+          --from-literal="POSTGRES_DB={{.PG_DB}}"
+      - echo "✓ nanoclaw-db Secret created."
+
+  secrets:llm:
+    desc: Create nanoclaw-llm Secret (Anthropic API key)
+    status:
+      - kubectl get secret nanoclaw-llm -n "{{.NAMESPACE}}" &>/dev/null
+    cmds:
+      - |
+        API_KEY="${ANTHROPIC_API_KEY:-}"
+
+        # Try reading from .env if not in environment
+        if [[ -z "$API_KEY" && -f "{{.REPO_ROOT}}/.env" ]]; then
+          API_KEY="$(grep -E '^ANTHROPIC_API_KEY=' "{{.REPO_ROOT}}/.env" | cut -d= -f2- | tr -d "'\"" || true)"
+        fi
+
+        # Prompt if still missing (only if interactive)
+        if [[ -z "$API_KEY" && -t 0 ]]; then
+          echo "! ANTHROPIC_API_KEY not found in environment or .env"
+          read -rp "Enter your Anthropic API key (or press Enter to skip): " API_KEY
+        fi
+
+        if [[ -n "$API_KEY" ]]; then
+          kubectl create secret generic nanoclaw-llm \
+            --namespace="{{.NAMESPACE}}" \
+            --from-literal="ANTHROPIC_API_KEY=${API_KEY}"
+          echo "✓ nanoclaw-llm Secret created."
+        else
+          echo "⚠ nanoclaw-llm Secret skipped — ANTHROPIC_API_KEY not available."
+          echo "  Set it and re-run:  ANTHROPIC_API_KEY=sk-ant-... task -d k8s secrets:llm"
+          echo "  Or create directly: kubectl create secret generic nanoclaw-llm -n {{.NAMESPACE}} --from-literal=ANTHROPIC_API_KEY=sk-ant-..."
+        fi
+
+  secrets:rotate-db:
+    desc: Rotate the Postgres password and recreate the Secret
+    cmds:
+      - kubectl delete secret nanoclaw-db -n "{{.NAMESPACE}}" --ignore-not-found
+      - task: secrets:db
+      - task: orchestrator:restart
+      - echo "✓ Database secret rotated. Orchestrator restarted."
+
+  secrets:rotate-llm:
+    desc: Rotate the LLM API key
+    cmds:
+      - kubectl delete secret nanoclaw-llm -n "{{.NAMESPACE}}" --ignore-not-found
+      - task: secrets:llm
+      - task: orchestrator:restart
+      - echo "✓ LLM secret rotated. Orchestrator restarted."
+
+  # ─── Rollout & status ──────────────────────────────────────────────
+
+  rollout:wait:
+    desc: Wait for Postgres and orchestrator to be ready
+    cmds:
+      - echo "→ Waiting for PostgreSQL..."
+      - kubectl rollout status statefulset/postgres -n "{{.NAMESPACE}}" --timeout=120s
+      - echo "→ Waiting for orchestrator..."
+      - kubectl rollout status deployment/nanoclaw-orchestrator -n "{{.NAMESPACE}}" --timeout=120s
+      - echo "✓ All services ready."
+
+  rollout:restart:
+    desc: Restart all workloads to pick up secrets, then wait
+    cmds:
+      - kubectl delete pod -n "{{.NAMESPACE}}" -l component=postgres --ignore-not-found 2>/dev/null || true
+      - kubectl rollout restart deployment/nanoclaw-orchestrator -n "{{.NAMESPACE}}"
+      - task: rollout:wait
+
+  orchestrator:restart:
+    desc: Restart the orchestrator deployment
+    cmds:
+      - kubectl rollout restart deployment/nanoclaw-orchestrator -n "{{.NAMESPACE}}"
+      - kubectl rollout status deployment/nanoclaw-orchestrator -n "{{.NAMESPACE}}" --timeout=120s
+      - echo "✓ Orchestrator restarted."
+
+  status:
+    desc: Show pod and job status
+    cmds:
+      - echo "─── Pods ───"
+      - kubectl get pods -n "{{.NAMESPACE}}" -o wide
+      - echo ""
+      - echo "─── Jobs ───"
+      - kubectl get jobs -n "{{.NAMESPACE}}" 2>/dev/null || echo "  (no jobs)"
+      - echo ""
+      - echo "─── PVCs ───"
+      - kubectl get pvc -n "{{.NAMESPACE}}"
+
+  status:summary:
+    desc: Print deployment summary
+    silent: true
+    cmds:
+      - |
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo " NanoClaw deployed to kind cluster '{{.CLUSTER_NAME}}'"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        echo "  Cluster:     kind-{{.CLUSTER_NAME}}"
+        echo "  Namespace:   {{.NAMESPACE}}"
+        echo "  Postgres:    postgres.{{.NAMESPACE}}.svc.cluster.local:5432"
+        echo ""
+        echo "  Tasks:"
+        echo "    task -d k8s status                     # pod/job/pvc status"
+        echo "    task -d k8s logs                       # orchestrator logs"
+        echo "    task -d k8s logs:postgres               # postgres logs"
+        echo "    task -d k8s redeploy                   # rebuild + redeploy"
+        echo "    task -d k8s secrets:rotate-db           # rotate DB password"
+        echo "    task -d k8s secrets:rotate-llm          # rotate API key"
+        echo "    task -d k8s down                       # delete cluster"
+        echo ""
+
+  # ─── Logs ──────────────────────────────────────────────────────────
+
+  logs:
+    desc: Tail orchestrator logs
+    cmds:
+      - kubectl logs -f deploy/nanoclaw-orchestrator -n "{{.NAMESPACE}}"
+
+  logs:postgres:
+    desc: Tail PostgreSQL logs
+    cmds:
+      - kubectl logs -f statefulset/postgres -n "{{.NAMESPACE}}"
+
+  logs:job:
+    desc: 'Show logs for a specific agent job (usage: task logs:job -- JOB_NAME)'
+    cmds:
+      - kubectl logs "job/{{.CLI_ARGS}}" -n "{{.NAMESPACE}}"
+
+  # ─── Utilities ─────────────────────────────────────────────────────
+
+  psql:
+    desc: Open a psql shell to the in-cluster Postgres
+    cmds:
+      - |
+        kubectl exec -it statefulset/postgres -n "{{.NAMESPACE}}" -- \
+          psql -U nanoclaw -d nanoclaw
+
+  shell:
+    desc: Open a shell in the orchestrator pod
+    cmds:
+      - |
+        kubectl exec -it deploy/nanoclaw-orchestrator -n "{{.NAMESPACE}}" -- /bin/sh
+
+  clean:jobs:
+    desc: Delete all completed/failed agent jobs
+    cmds:
+      - |
+        kubectl delete jobs -n "{{.NAMESPACE}}" -l app=nanoclaw-agent \
+          --field-selector status.successful=1 2>/dev/null || true
+        kubectl delete jobs -n "{{.NAMESPACE}}" -l app=nanoclaw-agent \
+          --field-selector status.failed=1 2>/dev/null || true
+        echo "✓ Completed/failed agent jobs cleaned up."
+
+  port-forward:postgres:
+    desc: 'Forward Postgres port to localhost:5432'
+    cmds:
+      - kubectl port-forward statefulset/postgres 5432:5432 -n "{{.NAMESPACE}}"

@@ -1,7 +1,57 @@
 ---
 # Workspace PVCs for NanoClaw
 # These provide persistent storage for group data, global shared data, and config.
-# Adjust storageClassName for your cluster (e.g., efs-sc for AWS, standard-rwx for GCP).
+#
+# For kind/local-dev: uses hostPath PVs provisioned via kind extraMounts.
+#   The Taskfile cluster:create task configures the kind node to mount host dirs.
+#   hostPath PVs on a single-node cluster naturally support ReadWriteMany.
+#
+# For production: set storageClassName to an RWX-capable class (e.g., efs-sc for AWS EFS,
+#   standard-rwx for GCP Filestore, azurefile for AKS) and remove the static PVs below.
+
+# ─── Static PVs for kind (hostPath) ─────────────────────────────────────────
+# These bind to directories mounted into the kind node via extraMounts.
+# Delete these when deploying to a real cluster with dynamic provisioning.
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nanoclaw-global-pv
+  labels:
+    app: nanoclaw
+    component: storage
+    type: local-dev
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadWriteMany
+  storageClassName: nanoclaw-local
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: /data/nanoclaw/global
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nanoclaw-groups-pv
+  labels:
+    app: nanoclaw
+    component: storage
+    type: local-dev
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteMany
+  storageClassName: nanoclaw-local
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: /data/nanoclaw/groups
+    type: DirectoryOrCreate
+---
+# ─── PVCs ────────────────────────────────────────────────────────────────────
 
 # Global shared storage — mounted read-only by non-main groups
 apiVersion: v1
@@ -15,10 +65,10 @@ metadata:
 spec:
   accessModes:
     - ReadWriteMany
+  storageClassName: nanoclaw-local # kind: hostPath; production: change to your RWX StorageClass
   resources:
     requests:
       storage: 5Gi
-  # storageClassName: standard-rwx  # Uncomment and set for your cluster
 ---
 # Groups config storage — holds CLAUDE.md and group definitions
 apiVersion: v1
@@ -32,10 +82,10 @@ metadata:
 spec:
   accessModes:
     - ReadWriteMany
+  storageClassName: nanoclaw-local # kind: hostPath; production: change to your RWX StorageClass
   resources:
     requests:
       storage: 1Gi
-  # storageClassName: standard-rwx  # Uncomment and set for your cluster
 ---
 # Store directory — holds channel auth data and local state
 apiVersion: v1
@@ -49,6 +99,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
+  storageClassName: standard # RWO is fine — only orchestrator uses this
   resources:
     requests:
       storage: 1Gi
